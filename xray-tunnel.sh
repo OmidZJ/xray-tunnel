@@ -8,14 +8,19 @@ XRAY_BIN="/usr/local/bin/xray"
 usage() {
   cat <<'EOF'
 Usage (non-interactive):
-  xray-tunnel.sh setup /path/to/outbound.json [--only-ports "80,443,8080,10000-10100"]
+  xray-tunnel.sh setup /path/to/config_input [--only-ports "80,443,8080,10000-10100"]
+    - config_input can be:
+        * a v2ray link: vmess://..., vless://..., trojan://...
+        * a JSON file: full Xray client config (will extract first outbound)
+        * a JSON file: a single outbound object
+
   xray-tunnel.sh rollback
 
 Interactive mode:
   Just run: xray-tunnel.sh
   - Choose: Setup Xray or Rollback
   - Enter ports to tunnel (blank = ALL TCP)
-  - Paste your outbound JSON (press Ctrl+D when done)
+  - Paste your v2ray config/link (Ctrl+D to finish)
 
 Notes:
   --only-ports : Comma separated, supports ranges like 10000-10100.
@@ -29,10 +34,14 @@ apply_redirect_rule() {
   iptables -t nat -A OUTPUT -p tcp --dport "$d" -j REDIRECT --to-ports 12346
 }
 
-ensure_jq() {
+ensure_tools() {
   command -v jq >/dev/null 2>&1 || {
     echo "[+] Installing jq ..."
     apt-get update -y && apt-get install -y jq
+  }
+  command -v python3 >/dev/null 2>&1 || {
+    echo "[+] Installing python3 ..."
+    apt-get update -y && apt-get install -y python3
   }
 }
 
@@ -68,6 +77,200 @@ JSON
   fi
 }
 
+# Convert arbitrary user input (link or JSON) to a single outbound JSON
+to_outbound_json() {
+  # $1: path to input file OR a direct link string
+  local INPUT="$1"
+  local TMP_OUT="$(mktemp)"
+
+  # If it's a file, read contents; else treat as literal string (link)
+  local CONTENT
+  if [[ -f "$INPUT" ]]; then
+    CONTENT="$(cat "$INPUT")"
+  else
+    CONTENT="$INPUT"
+  fi
+
+  # Python converter: supports vmess, vless, trojan, or JSON
+  python3 - "$TMP_OUT" <<'PY'
+import sys, json, base64, urllib.parse
+
+out_path = sys.argv[1]
+raw = sys.stdin.read().strip()
+
+def b64fix(s):
+    # URL-safe and missing padding tolerated
+    s = s.replace('-', '+').replace('_', '/')
+    pad = (4 - len(s) % 4) % 4
+    return s + ('=' * pad)
+
+def outbound_from_vmess(link):
+    # vmess://<base64(json)>
+    b64 = link.split('://',1)[1]
+    data = json.loads(base64.b64decode(b64fix(b64)).decode('utf-8', 'ignore'))
+    add = data.get('add'); port = int(data.get('port', 0) or 0)
+    uid = data.get('id'); aid = int(data.get('aid', 0) or 0)
+    net = data.get('net') or 'tcp'
+    host = data.get('host') or ''
+    path = data.get('path') or ''
+    type_ = data.get('type') or 'none'
+    tls = data.get('tls') or ''
+    sni = data.get('sni') or data.get('host') or ''
+    scy = data.get('scy') or 'auto'  # encryption
+
+    stream = {"network": net}
+    if net == 'ws':
+        ws = {"path": path or "/", "headers": {}}
+        if host: ws["headers"]["Host"] = host
+        stream["wsSettings"] = ws
+    elif net == 'grpc' or net == 'gun':
+        svc = path.lstrip("/") if path else ""
+        stream["grpcSettings"] = {"serviceName": svc}
+
+    if tls in ('tls','reality'):
+        stream.setdefault("security", "tls" if tls=='tls' else 'reality')
+        if sni:
+            stream.setdefault("tlsSettings" if tls=='tls' else "realitySettings", {})["serverName"] = sni
+
+    return {
+        "tag": "proxy",
+        "protocol": "vmess",
+        "settings": {
+            "vnext": [{
+                "address": add, "port": port,
+                "users": [{
+                    "id": uid,
+                    "alterId": aid,
+                    "encryption": scy
+                }]
+            }]
+        },
+        "streamSettings": stream
+    }
+
+def outbound_from_vless(link):
+    # vless://<uuid>@host:port?query#name
+    u = urllib.parse.urlsplit(link)
+    uid = u.username or ''
+    host = u.hostname or ''
+    port = int(u.port or 0)
+    q = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+    net = q.get('type') or q.get('network') or 'tcp'
+    sec = q.get('security') or 'none'
+    sni = q.get('sni') or q.get('serverName') or q.get('host') or ''
+    flow = q.get('flow')
+    path = q.get('path') or q.get('serviceName') or ''
+    alpn = q.get('alpn')
+
+    stream = {"network": net}
+    if net == 'ws':
+        ws = {"path": path or "/", "headers": {}}
+        host_hdr = q.get('host') or q.get('Host')
+        if host_hdr: ws["headers"]["Host"] = host_hdr
+        stream["wsSettings"] = ws
+    elif net == 'grpc':
+        stream["grpcSettings"] = {"serviceName": path.lstrip("/") if path else ""}
+
+    if sec != 'none':
+        stream["security"] = sec
+        if sec == 'tls':
+            tls_settings = {}
+            if sni: tls_settings["serverName"] = sni
+            if alpn: tls_settings["alpn"] = alpn.split(',')
+            stream["tlsSettings"] = tls_settings
+        elif sec == 'reality':
+            reality = {}
+            if sni: reality["serverName"] = sni
+            stream["realitySettings"] = reality
+
+    user = {"id": uid, "encryption": q.get('encryption','none')}
+    if flow: user["flow"] = flow
+
+    return {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": host, "port": port,
+                "users": [user]
+            }]
+        },
+        "streamSettings": stream
+    }
+
+def outbound_from_trojan(link):
+    # trojan://password@host:port?query#name
+    u = urllib.parse.urlsplit(link)
+    pwd = urllib.parse.unquote(u.username or '')
+    host = u.hostname or ''
+    port = int(u.port or 0)
+    q = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+    sni = q.get('sni') or q.get('peer') or q.get('host') or ''
+    net = q.get('type') or 'tcp'
+    path = q.get('path') or q.get('serviceName') or ''
+    alpn = q.get('alpn')
+
+    stream = {"network": net}
+    # trojan defaults to tls
+    stream["security"] = "tls"
+    tls_settings = {}
+    if sni: tls_settings["serverName"] = sni
+    if alpn: tls_settings["alpn"] = alpn.split(',')
+    stream["tlsSettings"] = tls_settings
+
+    if net == 'ws':
+        ws = {"path": path or "/", "headers": {}}
+        host_hdr = q.get('host') or q.get('Host') or sni
+        if host_hdr: ws["headers"]["Host"] = host_hdr
+        stream["wsSettings"] = ws
+    elif net == 'grpc':
+        stream["grpcSettings"] = {"serviceName": path.lstrip("/") if path else ""}
+
+    return {
+        "tag": "proxy",
+        "protocol": "trojan",
+        "settings": {
+            "servers": [{
+                "address": host, "port": port,
+                "password": pwd
+            }]
+        },
+        "streamSettings": stream
+    }
+
+def try_json(raw):
+    j = json.loads(raw)
+    if isinstance(j, dict) and "outbounds" in j and isinstance(j["outbounds"], list) and j["outbounds"]:
+        return j["outbounds"][0]
+    if isinstance(j, dict) and "protocol" in j:  # assume outbound object
+        return j
+    raise ValueError("JSON provided but not an outbound or client config")
+
+raw_strip = raw.strip()
+out = None
+try:
+    if raw_strip.startswith("vmess://"):
+        out = outbound_from_vmess(raw_strip)
+    elif raw_strip.startswith("vless://"):
+        out = outbound_from_vless(raw_strip)
+    elif raw_strip.startswith("trojan://"):
+        out = outbound_from_trojan(raw_strip)
+    elif raw_strip.startswith("{"):
+        out = try_json(raw_strip)
+    else:
+        raise ValueError("Unsupported input format")
+except Exception as e:
+    sys.stderr.write(f"Parse error: {e}\n")
+    sys.exit(2)
+
+with open(out_path, "w") as f:
+    json.dump(out, f, ensure_ascii=False, indent=2)
+PY
+  ) <<< "$CONTENT"
+
+  echo "$TMP_OUT"
+}
+
 build_config() {
   local OUTBOUND_FILE="$1"
   echo "[+] Building final config.json ..."
@@ -101,10 +304,15 @@ apply_iptables_rules() {
   iptables -t nat -A OUTPUT -d 127.0.0.1/32 -j RETURN
   iptables -t nat -A OUTPUT -d 127.0.0.53/32 -j RETURN
 
-  # Exclude upstream server if literal IPv4
-  SERVER_IP=$(jq -r '.settings.vnext[0].address // empty' "$OUTBOUND_FILE")
+  # Exclude upstream server if literal IPv4 (vmess/vless)
+  SERVER_IP=$(jq -r '.settings.vnext[0].address // empty' "$OUTBOUND_FILE" 2>/dev/null || true)
   if [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     iptables -t nat -A OUTPUT -d "$SERVER_IP"/32 -j RETURN
+  fi
+  # Exclude for trojan format too
+  TROJAN_IP=$(jq -r '.settings.servers[0].address // empty' "$OUTBOUND_FILE" 2>/dev/null || true)
+  if [[ "$TROJAN_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    iptables -t nat -A OUTPUT -d "$TROJAN_IP"/32 -j RETURN
   fi
 
   if [[ -n "$ONLY_PORTS" ]]; then
@@ -145,29 +353,26 @@ do_rollback() {
 interactive_setup() {
   echo "== Xray Tunnel • Interactive Setup =="
   echo
-  # Ask ports
   read -r -p "Enter destination TCP ports to tunnel (comma/ranges), or leave blank for ALL: " ONLY_PORTS
 
-  # Capture outbound JSON
   echo
-  echo "Paste your outbound JSON below, then press Ctrl+D when finished:"
-  OUTBOUND_FILE="$(mktemp)"
-  cat > "$OUTBOUND_FILE"
-  echo
-  echo "[i] Validating outbound JSON..."
-  ensure_jq
-  jq empty "$OUTBOUND_FILE" || { echo "Invalid JSON"; rm -f "$OUTBOUND_FILE"; exit 1; }
+  echo "Paste your v2ray config/link (vmess://, vless://, trojan:// OR JSON). Press Ctrl+D when done:"
+  USER_INPUT_FILE="$(mktemp)"
+  cat > "$USER_INPUT_FILE"
 
-  # Proceed
-  ensure_jq
+  ensure_tools
   install_or_update_xray
   ensure_template
-  build_config "$OUTBOUND_FILE"
+
+  # Convert user input to outbound.json
+  OUTBOUND_JSON_FILE="$(to_outbound_json "$USER_INPUT_FILE")"
+
+  build_config "$OUTBOUND_JSON_FILE"
   restart_xray
   flush_nat_output
-  apply_iptables_rules "$OUTBOUND_FILE" "$ONLY_PORTS"
+  apply_iptables_rules "$OUTBOUND_JSON_FILE" "$ONLY_PORTS"
 
-  rm -f "$OUTBOUND_FILE"
+  rm -f "$USER_INPUT_FILE" "$OUTBOUND_JSON_FILE"
   echo
   echo "[✓] Setup complete!"
   echo "Test:"
@@ -193,37 +398,49 @@ interactive_menu() {
 # ---------- Entry ----------
 MODE="${1:-}"
 
-# Interactive mode if no args
 if [[ -z "${MODE}" ]]; then
   interactive_menu
   exit 0
 fi
 
-# Non-interactive (backward compatible)
 if [[ "$MODE" == "rollback" ]]; then
   do_rollback
   exit 0
 fi
 
 if [[ "$MODE" == "setup" ]]; then
-  OUTBOUND_FILE="${2:-}"
+  CONFIG_INPUT="${2:-}"
   ONLY_PORTS=""
   if [[ $# -ge 3 && "${3:-}" == "--only-ports" ]]; then
     ONLY_PORTS="${4:-}"
   fi
 
-  if [[ -z "$OUTBOUND_FILE" || ! -f "$OUTBOUND_FILE" ]]; then
-    usage; echo; echo "Error: missing or invalid outbound.json"; exit 1
+  if [[ -z "$CONFIG_INPUT" ]]; then
+    usage; echo; echo "Error: missing config input (link or JSON file)"; exit 1
   fi
 
-  ensure_jq
+  ensure_tools
   install_or_update_xray
   ensure_template
-  build_config "$OUTBOUND_FILE"
+
+  # If the arg looks like a link, convert directly; otherwise treat as file path
+  if [[ "$CONFIG_INPUT" =~ ^(vmess|vless|trojan):// ]]; then
+    TMP_IN="$(mktemp)"; echo -n "$CONFIG_INPUT" > "$TMP_IN"
+    OUTBOUND_JSON_FILE="$(to_outbound_json "$TMP_IN")"
+    rm -f "$TMP_IN"
+  else
+    if [[ ! -f "$CONFIG_INPUT" ]]; then
+      echo "File not found: $CONFIG_INPUT"; exit 1
+    fi
+    OUTBOUND_JSON_FILE="$(to_outbound_json "$CONFIG_INPUT")"
+  fi
+
+  build_config "$OUTBOUND_JSON_FILE"
   restart_xray
   flush_nat_output
-  apply_iptables_rules "$OUTBOUND_FILE" "$ONLY_PORTS"
+  apply_iptables_rules "$OUTBOUND_JSON_FILE" "$ONLY_PORTS"
 
+  rm -f "$OUTBOUND_JSON_FILE"
   echo
   echo "[✓] Setup complete!"
   echo "Test:"

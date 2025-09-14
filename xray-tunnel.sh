@@ -81,7 +81,8 @@ JSON
 to_outbound_json() {
   # $1: path to input file OR a direct link string
   local INPUT="$1"
-  local TMP_OUT="$(mktemp)"
+  local TMP_OUT
+  TMP_OUT="$(mktemp)"
 
   # If it's a file, read contents; else treat as literal string (link)
   local CONTENT
@@ -91,65 +92,49 @@ to_outbound_json() {
     CONTENT="$INPUT"
   fi
 
-  # Python converter: supports vmess, vless, trojan, or JSON
-  python3 - "$TMP_OUT" <<'PY'
-import sys, json, base64, urllib.parse
+  # Pass CONTENT via env to Python (avoid mixing heredoc with here-string/pipe)
+  XRAY_INPUT="$CONTENT" python3 - "$TMP_OUT" <<'PY'
+import sys, json, base64, urllib.parse, os
 
 out_path = sys.argv[1]
-raw = sys.stdin.read().strip()
+raw = os.environ.get("XRAY_INPUT","").strip()
 
 def b64fix(s):
-    # URL-safe and missing padding tolerated
     s = s.replace('-', '+').replace('_', '/')
     pad = (4 - len(s) % 4) % 4
     return s + ('=' * pad)
 
 def outbound_from_vmess(link):
-    # vmess://<base64(json)>
     b64 = link.split('://',1)[1]
-    data = json.loads(base64.b64decode(b64fix(b64)).decode('utf-8', 'ignore'))
+    data = json.loads(base64.b64decode(b64fix(b64)).decode('utf-8','ignore'))
     add = data.get('add'); port = int(data.get('port', 0) or 0)
     uid = data.get('id'); aid = int(data.get('aid', 0) or 0)
     net = data.get('net') or 'tcp'
     host = data.get('host') or ''
     path = data.get('path') or ''
-    type_ = data.get('type') or 'none'
     tls = data.get('tls') or ''
     sni = data.get('sni') or data.get('host') or ''
-    scy = data.get('scy') or 'auto'  # encryption
-
+    scy = data.get('scy') or 'auto'
     stream = {"network": net}
     if net == 'ws':
         ws = {"path": path or "/", "headers": {}}
         if host: ws["headers"]["Host"] = host
         stream["wsSettings"] = ws
-    elif net == 'grpc' or net == 'gun':
+    elif net in ('grpc','gun'):
         svc = path.lstrip("/") if path else ""
         stream["grpcSettings"] = {"serviceName": svc}
-
     if tls in ('tls','reality'):
-        stream.setdefault("security", "tls" if tls=='tls' else 'reality')
+        stream["security"] = 'tls' if tls=='tls' else 'reality'
         if sni:
-            stream.setdefault("tlsSettings" if tls=='tls' else "realitySettings", {})["serverName"] = sni
-
+            key = "tlsSettings" if tls=='tls' else "realitySettings"
+            stream[key] = {"serverName": sni}
     return {
-        "tag": "proxy",
-        "protocol": "vmess",
-        "settings": {
-            "vnext": [{
-                "address": add, "port": port,
-                "users": [{
-                    "id": uid,
-                    "alterId": aid,
-                    "encryption": scy
-                }]
-            }]
-        },
+        "tag":"proxy","protocol":"vmess",
+        "settings":{"vnext":[{"address":add,"port":port,"users":[{"id":uid,"alterId":aid,"encryption":scy}]}]},
         "streamSettings": stream
     }
 
 def outbound_from_vless(link):
-    # vless://<uuid>@host:port?query#name
     u = urllib.parse.urlsplit(link)
     uid = u.username or ''
     host = u.hostname or ''
@@ -161,7 +146,6 @@ def outbound_from_vless(link):
     flow = q.get('flow')
     path = q.get('path') or q.get('serviceName') or ''
     alpn = q.get('alpn')
-
     stream = {"network": net}
     if net == 'ws':
         ws = {"path": path or "/", "headers": {}}
@@ -170,7 +154,6 @@ def outbound_from_vless(link):
         stream["wsSettings"] = ws
     elif net == 'grpc':
         stream["grpcSettings"] = {"serviceName": path.lstrip("/") if path else ""}
-
     if sec != 'none':
         stream["security"] = sec
         if sec == 'tls':
@@ -182,24 +165,15 @@ def outbound_from_vless(link):
             reality = {}
             if sni: reality["serverName"] = sni
             stream["realitySettings"] = reality
-
     user = {"id": uid, "encryption": q.get('encryption','none')}
     if flow: user["flow"] = flow
-
     return {
-        "tag": "proxy",
-        "protocol": "vless",
-        "settings": {
-            "vnext": [{
-                "address": host, "port": port,
-                "users": [user]
-            }]
-        },
+        "tag":"proxy","protocol":"vless",
+        "settings":{"vnext":[{"address":host,"port":port,"users":[user]}]},
         "streamSettings": stream
     }
 
 def outbound_from_trojan(link):
-    # trojan://password@host:port?query#name
     u = urllib.parse.urlsplit(link)
     pwd = urllib.parse.unquote(u.username or '')
     host = u.hostname or ''
@@ -209,15 +183,11 @@ def outbound_from_trojan(link):
     net = q.get('type') or 'tcp'
     path = q.get('path') or q.get('serviceName') or ''
     alpn = q.get('alpn')
-
-    stream = {"network": net}
-    # trojan defaults to tls
-    stream["security"] = "tls"
+    stream = {"network": net, "security":"tls"}
     tls_settings = {}
     if sni: tls_settings["serverName"] = sni
     if alpn: tls_settings["alpn"] = alpn.split(',')
     stream["tlsSettings"] = tls_settings
-
     if net == 'ws':
         ws = {"path": path or "/", "headers": {}}
         host_hdr = q.get('host') or q.get('Host') or sni
@@ -225,16 +195,9 @@ def outbound_from_trojan(link):
         stream["wsSettings"] = ws
     elif net == 'grpc':
         stream["grpcSettings"] = {"serviceName": path.lstrip("/") if path else ""}
-
     return {
-        "tag": "proxy",
-        "protocol": "trojan",
-        "settings": {
-            "servers": [{
-                "address": host, "port": port,
-                "password": pwd
-            }]
-        },
+        "tag":"proxy","protocol":"trojan",
+        "settings":{"servers":[{"address":host,"port":port,"password":pwd}]},
         "streamSettings": stream
     }
 
@@ -242,12 +205,14 @@ def try_json(raw):
     j = json.loads(raw)
     if isinstance(j, dict) and "outbounds" in j and isinstance(j["outbounds"], list) and j["outbounds"]:
         return j["outbounds"][0]
-    if isinstance(j, dict) and "protocol" in j:  # assume outbound object
+    if isinstance(j, dict) and "protocol" in j:
         return j
     raise ValueError("JSON provided but not an outbound or client config")
 
 raw_strip = raw.strip()
-out = None
+if not raw_strip:
+    sys.stderr.write("Empty input\n"); sys.exit(2)
+
 try:
     if raw_strip.startswith("vmess://"):
         out = outbound_from_vmess(raw_strip)
@@ -260,16 +225,15 @@ try:
     else:
         raise ValueError("Unsupported input format")
 except Exception as e:
-    sys.stderr.write(f"Parse error: {e}\n")
-    sys.exit(2)
+    sys.stderr.write(f"Parse error: {e}\n"); sys.exit(2)
 
 with open(out_path, "w") as f:
     json.dump(out, f, ensure_ascii=False, indent=2)
 PY
-  ) <<< "$CONTENT"
 
   echo "$TMP_OUT"
 }
+
 
 build_config() {
   local OUTBOUND_FILE="$1"
